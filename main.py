@@ -56,6 +56,10 @@ def new_job(j: NewJob, x_token: str = Header(default="")):
         raise HTTPException(413, "files too large")
     jid = uuid.uuid4().hex[:12]
     with _lock:
+        if j.thread and not j.session:
+            prev = [v for v in JOBS.values() if v.get("thread") == j.thread and v.get("session") and v["status"] in ("done", "error")]
+            if prev:
+                j.session = max(prev, key=lambda v: v["finished"])["session"]
         JOBS[jid] = {"id": jid, "prompt": j.prompt, "thread": j.thread, "session": j.session, "user": j.user,
                      "status": "queued", "created": time.time(), "started": 0, "finished": 0, "output": "",
                      "files_in": j.files, "files": []}
@@ -79,6 +83,36 @@ def get_file(jid: str, name: str, x_token: str = Header(default="")):
     for f in j.get("files", []):
         if f["name"] == name:
             return {"name": name, "b64": f["b64"]}
+    raise HTTPException(404, "no such file")
+
+
+@app.get("/jobs/{jid}/wait")
+def wait_job(jid: str, seconds: int = 50, x_token: str = Header(default="")):
+    """Blocks up to `seconds` (max 55) until the job is done or failed, then answers like GET /jobs/{id}. Fewer loop turns for a flow."""
+    _auth(x_token)
+    deadline = time.time() + max(1, min(seconds, 55))
+    while time.time() < deadline:
+        j = JOBS.get(jid)
+        if not j:
+            raise HTTPException(404, "unknown")
+        if j["status"] in ("done", "error"):
+            break
+        time.sleep(2)
+    return get_job(jid, x_token)
+
+@app.get("/jobs/{jid}/files/{name}/raw")
+def get_file_raw(jid: str, name: str, x_token: str = Header(default="")):
+    """The file as bytes with its content type, so a flow can write it straight into OneDrive."""
+    _auth(x_token)
+    import base64, mimetypes
+    from fastapi.responses import Response
+    j = JOBS.get(jid)
+    if not j:
+        raise HTTPException(404, "unknown")
+    for f in j.get("files", []):
+        if f["name"] == name:
+            mt = mimetypes.guess_type(name)[0] or "application/octet-stream"
+            return Response(content=base64.b64decode(f["b64"]), media_type=mt, headers={"Content-Disposition": f'attachment; filename="{name}"'})
     raise HTTPException(404, "no such file")
 
 @app.get("/work/next")
